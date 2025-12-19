@@ -12,9 +12,10 @@ constexpr const char* cTextServiceUuid = "12345678-1234-1234-1234-1234567890ab";
 constexpr const char* cMessageServiceUuid = "abcd1234-1234-1234-1234-1234567890ab";
 constexpr const char* cLocalName = "ArduinoBL";
 
-constexpr const int cVerticalServoPin = 4;
-constexpr const int cHorizontalServoPin = 5;
-constexpr const int cServoDelayMs = 10;
+constexpr const int cVerticalServoPin = 5;
+constexpr const int cHorizontalServoPin = 4;
+constexpr const int cVerticalServoDelayMs = 1;
+constexpr const int cHorizontalServoDelayMs = 1;
 
 #ifndef MIN_LOG_LEVEL
 #define MIN_LOG_LEVEL 2 // 0 - PERIODIC, 1 - DEBUG, 2 - INFO, 3 - WARN, 4 - ERROR
@@ -121,15 +122,13 @@ using RawMessage = String;
 struct ServoRequest
 {
     uint16_t msg_id;
-    int16_t s1_offset; // up / down
-    int16_t s2_offset; // left / right
+    int16_t h_offset; // left / right
+    int16_t v_offset; // up / down
 };
 
 struct AckResponse
 {
     uint16_t msg_id;
-    bool success;
-    String error_message;
 };
 
 struct TaskFinishedResponse
@@ -147,36 +146,9 @@ struct TaskFinishedResponse
     }
 
     outCommand.msg_id = doc["msg_id"];
-    outCommand.s1_offset = doc["s1_offset"];
-    outCommand.s2_offset = doc["s2_offset"];
+    outCommand.h_offset = doc["h_offset"];
+    outCommand.v_offset = doc["v_offset"];
 
-    return true;
-}
-
-[[nodiscard]] bool decodeAckResponse(const String& jsonString, AckResponse& outAck)
-{
-    JsonDocument doc;
-    DeserializationError error = deserializeJson(doc, jsonString);
-    if (error)
-    {
-        return false;
-    }
-
-    outAck.msg_id = doc["msg_id"];
-    outAck.success = doc["success"];
-    outAck.error_message = doc["error_msg"].as<const char*>();
-
-    return true;
-}
-
-[[nodiscard]] bool encodeServoRequest(const ServoRequest& command, String& outJsonString)
-{
-    JsonDocument doc;
-    doc["msg_id"] = command.msg_id;
-    doc["s1_offset"] = command.s1_offset;
-    doc["s2_offset"] = command.s2_offset;
-
-    serializeJson(doc, outJsonString);
     return true;
 }
 
@@ -184,8 +156,16 @@ struct TaskFinishedResponse
 {
     JsonDocument doc;
     doc["msg_id"] = ack.msg_id;
-    doc["success"] = ack.success;
-    doc["error_message"] = ack.error_message;
+
+    serializeJson(doc, outJsonString);
+    return true;
+}
+
+[[nodiscard]] bool encodeTaskFinishedResponse(const TaskFinishedResponse& response,
+                                               String& outJsonString)
+{
+    JsonDocument doc;
+    doc["msg_id"] = response.msg_id;
 
     serializeJson(doc, outJsonString);
     return true;
@@ -194,12 +174,21 @@ struct TaskFinishedResponse
 class BluetoothService
 {
   public:
-    enum class BluetoothMessageResult
+    static constexpr int32_t CRITICAL_BLUETOOTH_ERROR = 1000;
+    enum class BluetoothMessageResult : int32_t
     {
         OK = 0,
+        ROBOT_BUSY,
         VALIDATION_FAILED,
+        SERVO_UNINITIALIZED = CRITICAL_BLUETOOTH_ERROR,
+        SENDING_MESSAGE_FAILED,
         PROCESSING_FAILED
     };
+
+    bool isCriticalError(BluetoothMessageResult result) const
+    {
+        return static_cast<int32_t>(result) >= CRITICAL_BLUETOOTH_ERROR;
+    }
 
   public:
     using ProcessingCallbackType = std::function<BluetoothMessageResult(const RawMessage&)>;
@@ -263,38 +252,20 @@ class BluetoothService
         if (incoming.length() > 0)
         {
             const auto processingResult = mProcessingCallback(incoming);
-            if (processingResult != BluetoothMessageResult::OK)
+            if(processingResult == BluetoothMessageResult::OK)
             {
-                LOG_ERROR_BLE("Error processing incoming message: raw data: " + incoming);
-                return;
+                LOG_INFO_BLE("Message processed successfully");
             }
-            // ServoRequest command;
-            // if (!decodeServoRequest(incoming, command))
-            // {
-            //     LOG_ERROR_BLE("Failed to decode incoming servo command");
-            //     return;
-            // }
-            // const auto result = mProcessingCallback(command);
-            // // Send acknowledgment
-            // AckResponse ack;
-            // ack.msg_id = command.msg_id;
-            // ack.success = (result == ServoActionResult::OK);
-            // if (!ack.success)
-            // {
-            //     ack.error_message =
-            //         "Servo action failed with code: " + String(static_cast<int>(result));
-            // }
-            // LOG_DEBUG_BLE("Sending acknowledgment for msg_id: " + String(ack.msg_id));
-            // String ackJson;
-            // if (!encodeAckResponse(ack, ackJson))
-            // {
-            //     LOG_ERROR_BLE("Failed to encode acknowledgment message");
-            //     return;
-            // }
-            // if (!send(ackJson))
-            // {
-            //     LOG_ERROR_BLE("Failed to send acknowledgment message");
-            // }
+            else
+            {
+                LOG_WARN_BLE("Message processing resulted in: " +
+                              String(static_cast<int>(processingResult)));
+            }
+            if (isCriticalError(processingResult))
+            {
+                LOG_ERROR_BLE("Error while processing: " + static_cast<int>(processingResult));
+                fatalError("Critical BLE processing error");
+            }
         }
     }
 
@@ -320,6 +291,42 @@ class BluetoothService
         return mMessageService.writeValue(message);
     }
 
+    [[nodiscard]] bool sendAckResponse(uint16_t msg_id)
+    {
+        AckResponse ackResponse;
+        ackResponse.msg_id = msg_id;
+        String ackJson;
+        if (!encodeAckResponse(ackResponse, ackJson))
+        {
+            LOG_ERROR_BLE("Failed to encode ACK response");
+            return false;
+        }
+        if (!send(ackJson))
+        {
+            LOG_ERROR_BLE("Failed to send ACK response");
+            return false;
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool sendTaskFinishedResponse(uint16_t msg_id)
+    {
+        TaskFinishedResponse taskFinishedResponse;
+        taskFinishedResponse.msg_id = msg_id;
+        String responseJson;
+        if (!encodeTaskFinishedResponse(taskFinishedResponse, responseJson))
+        {
+            LOG_ERROR_BLE("Failed to encode Task Finished response");
+            return false;
+        }
+        if (!send(responseJson))
+        {
+            LOG_ERROR_BLE("Failed to send Task Finished response");
+            return false;
+        }
+        return true;
+    }
+
   private:
     [[nodiscard]] BLEDevice getCentralDevice() const
     {
@@ -332,6 +339,12 @@ class BluetoothService
     BLEStringCharacteristic mMessageService;
 };
 
+struct ServoConstaint
+{
+    const int MIN_POSITION;
+    const int MAX_POSITION;
+};
+
 enum class ServoState
 {
     IDLE = 0,
@@ -340,11 +353,13 @@ enum class ServoState
 
 struct ServoDevice
 {
-    int pin;
+    const int pin;
     Servo servo;
     ServoState state;
     int currentPosition;
     int targetPosition;
+    const int delay;
+    const ServoConstaint constraints;
 };
 
 class ServoService
@@ -352,15 +367,21 @@ class ServoService
   public:
     enum class ServoActionResult
     {
-        OK = 0,
+        IN_PROGRESS = 0,
         OUT_OF_RANGE,
         UNKNOWN_FAILURE
     };
 
   public:
     ServoService()
-        : mVerticalServoDevice{cVerticalServoPin, Servo(), ServoState::IDLE, 90, 90},
-          mHorizontalServoDevice{cHorizontalServoPin, Servo(), ServoState::IDLE, 90, 90}
+    // clang-format off
+        : mHorizontalServoDevice{
+            cHorizontalServoPin, Servo(), ServoState::IDLE, 
+            90, 90, cHorizontalServoDelayMs, ServoConstaint{0, 180} }
+        , mVerticalServoDevice{ 
+            cVerticalServoPin, Servo(), ServoState::IDLE, 
+            90, 90, cVerticalServoDelayMs, ServoConstaint{45, 135} }
+    // clang-format on
     {
         if (!initServos())
         {
@@ -371,12 +392,11 @@ class ServoService
     [[nodiscard]] bool initServos()
     {
         LOG_INFO_SERVO("Initializing servos...");
-        mVerticalServoDevice.servo.attach(mVerticalServoDevice.pin, 500, 2400);
-        mHorizontalServoDevice.servo.attach(mHorizontalServoDevice.pin, 500, 2400);
+        mVerticalServoDevice.servo.attach(mVerticalServoDevice.pin, 500, 2500);
+        mHorizontalServoDevice.servo.attach(mHorizontalServoDevice.pin, 500, 2500);
         mVerticalServoDevice.servo.setPeriodHertz(50);
         mHorizontalServoDevice.servo.setPeriodHertz(50);
         LOG_INFO_SERVO("Servos initialized.");
-        // Set servos to known default positions first
         LOG_INFO_SERVO("Setting servos to default positions (90 degrees)...");
         mVerticalServoDevice.servo.write(90);
         mHorizontalServoDevice.servo.write(90);
@@ -388,7 +408,7 @@ class ServoService
         LOG_INFO_SERVO(
             "Current positions - Vertical: " + String(mVerticalServoDevice.currentPosition) +
             ", Horizontal: " + String(mHorizontalServoDevice.currentPosition));
-        delay(1000); // Wait for servos to reach position
+        delay(100); // Wait for servos to reach position
         return true;
     }
 
@@ -400,46 +420,8 @@ class ServoService
             return;
         }
         unsigned long currentMillis = millis();
-        if (currentMillis - mLastUpdateTime >= mDelay)
-        {
-            bool verticalDone =
-                (mVerticalServoDevice.currentPosition == mVerticalServoDevice.targetPosition);
-            bool horizontalDone =
-                (mHorizontalServoDevice.currentPosition == mHorizontalServoDevice.targetPosition);
-            if (!verticalDone)
-            {
-                mVerticalServoDevice.currentPosition +=
-                    (mVerticalServoDevice.targetPosition > mVerticalServoDevice.currentPosition)
-                        ? 1
-                        : -1;
-                mVerticalServoDevice.servo.write(mVerticalServoDevice.currentPosition);
-                LOG_DEBUG_SERVO("Vertical servo moved to position: " +
-                                String(mVerticalServoDevice.currentPosition));
-            }
-            if (!horizontalDone)
-            {
-                mHorizontalServoDevice.currentPosition +=
-                    (mHorizontalServoDevice.targetPosition > mHorizontalServoDevice.currentPosition)
-                        ? 1
-                        : -1;
-                mHorizontalServoDevice.servo.write(mHorizontalServoDevice.currentPosition);
-                LOG_DEBUG_SERVO("Horizontal servo moved to position: " +
-                                String(mHorizontalServoDevice.currentPosition));
-            }
-            if (verticalDone)
-            {
-                mVerticalServoDevice.state = ServoState::IDLE;
-                LOG_INFO_SERVO("Vertical servo reached target position: " +
-                               String(mVerticalServoDevice.currentPosition));
-            }
-            if (horizontalDone)
-            {
-                mHorizontalServoDevice.state = ServoState::IDLE;
-                LOG_INFO_SERVO("Horizontal servo reached target position: " +
-                               String(mHorizontalServoDevice.currentPosition));
-            }
-            mLastUpdateTime = currentMillis;
-        }
+        updateHorizontal(currentMillis);
+        updateVertical(currentMillis);
     }
 
     [[nodiscard]] ServoActionResult moveServos(int16_t verticalOffset, int16_t horizontalOffset)
@@ -448,8 +430,10 @@ class ServoService
                        ", Horizontal offset: " + String(horizontalOffset));
         int newVerticalPosition = mVerticalServoDevice.currentPosition + verticalOffset;
         int newHorizontalPosition = mHorizontalServoDevice.currentPosition + horizontalOffset;
-        if (newVerticalPosition < 0 || newVerticalPosition > 180 || newHorizontalPosition < 0 ||
-            newHorizontalPosition > 180)
+        if (newVerticalPosition < mVerticalServoDevice.constraints.MIN_POSITION ||
+            newVerticalPosition > mVerticalServoDevice.constraints.MAX_POSITION ||
+            newHorizontalPosition < mHorizontalServoDevice.constraints.MIN_POSITION ||
+            newHorizontalPosition > mHorizontalServoDevice.constraints.MAX_POSITION)
         {
             LOG_WARN_SERVO(
                 "Requested servo positions out of range. Vertical: " + String(newVerticalPosition) +
@@ -461,7 +445,7 @@ class ServoService
         mVerticalServoDevice.state = ServoState::MOVING;
         mHorizontalServoDevice.state = ServoState::MOVING;
         LOG_INFO_SERVO("Servos moving to new positions.");
-        return ServoActionResult::OK;
+        return ServoActionResult::IN_PROGRESS;
     }
 
     [[nodiscard]] bool parseServoRequest(const RawMessage& rawMessage, ServoRequest& command)
@@ -471,12 +455,12 @@ class ServoService
             LOG_ERROR_SERVO("Failed to decode incoming servo command");
             return false;
         }
-        if (command.s1_offset > 180 || command.s2_offset > 180 || command.s1_offset < -180 ||
-            command.s2_offset < -180)
-        {
-            LOG_WARN_SERVO("Received servo command with out of range offsets. Ignoring.");
-            return false;
-        }
+        // if (command.h_offset > 180 || command.v_offset > 180 || command.h_offset < -180 ||
+        //     command.v_offset < -180)
+        // {
+        //     LOG_WARN_SERVO("Received servo command with out of range offsets. Ignoring.");
+        //     return false;
+        // }
         return true;
     }
 
@@ -490,16 +474,86 @@ class ServoService
         return mHorizontalServoDevice.state;
     }
 
+    [[nodiscard]] bool areServosIdle() const
+    {
+        return (mVerticalServoDevice.state == ServoState::IDLE) &&
+               (mHorizontalServoDevice.state == ServoState::IDLE);
+    }
+
+    [[nodiscard]] uint16_t getCurrentMsgId() const
+    {
+        return mCurrentMsgId;
+    }
+
+    void setCurrentMsgId(uint16_t msgId)
+    {
+        mCurrentMsgId = msgId;
+    }
+
   private:
-    ServoDevice mVerticalServoDevice;
+    [[nodiscard]] int getHorizontalOffset() const
+    {
+        return mHorizontalServoDevice.targetPosition - mHorizontalServoDevice.currentPosition;
+    }
+
+    [[nodiscard]] int getVerticalOffset() const
+    {
+        return mVerticalServoDevice.targetPosition - mVerticalServoDevice.currentPosition;
+    }
+
+    void updateHorizontal(unsigned long currentMillis)
+    {
+        if (currentMillis - mLastHorizontalUpdateTime >= mHorizontalServoDevice.delay)
+        {
+            const auto currentHorizontalOffset = getHorizontalOffset();
+            if (currentHorizontalOffset != 0)
+            {
+                mHorizontalServoDevice.currentPosition += (currentHorizontalOffset > 0) ? 1 : -1;
+                mHorizontalServoDevice.servo.write(mHorizontalServoDevice.currentPosition);
+                LOG_DEBUG_SERVO("Horizontal servo moved to position: " +
+                                String(mHorizontalServoDevice.currentPosition));
+            }
+            if (getHorizontalOffset() == 0)
+            {
+                mHorizontalServoDevice.state = ServoState::IDLE;
+                LOG_PERIODIC_SERVO("Horizontal servo reached target position: " +
+                               String(mHorizontalServoDevice.currentPosition));
+            }
+            mLastHorizontalUpdateTime = currentMillis;
+        }
+    }
+
+    void updateVertical(unsigned long currentMillis)
+    {
+        if (currentMillis - mLastVerticalUpdateTime >= mVerticalServoDevice.delay)
+        {
+            const auto currentVerticalOffset = getVerticalOffset();
+            if (currentVerticalOffset != 0)
+            {
+                mVerticalServoDevice.currentPosition += (currentVerticalOffset > 0) ? 1 : -1;
+                mVerticalServoDevice.servo.write(mVerticalServoDevice.currentPosition);
+                LOG_DEBUG_SERVO("Vertical servo moved to position: " +
+                                String(mVerticalServoDevice.currentPosition));
+            }
+            if (getVerticalOffset() == 0)
+            {
+                mVerticalServoDevice.state = ServoState::IDLE;
+                LOG_PERIODIC_SERVO("Vertical servo reached target position: " +
+                               String(mVerticalServoDevice.currentPosition));
+            }
+            mLastVerticalUpdateTime = currentMillis;
+        }
+    }
+
     ServoDevice mHorizontalServoDevice;
-    const int mDelay = cServoDelayMs;
-    unsigned long mLastUpdateTime = 0;
+    ServoDevice mVerticalServoDevice;
+    unsigned long mLastHorizontalUpdateTime = 0;
+    unsigned long mLastVerticalUpdateTime = 0;
+    uint16_t mCurrentMsgId = 0;
 };
 
 BluetoothService* gBleService;
 ServoService* gServoService;
-
 bool gRequestedReset = false;
 
 void handleSerialCommands()
@@ -518,6 +572,55 @@ void handleSerialCommands()
     }
 }
 
+void runTestRoutine()
+{
+    const auto result = gServoService->moveServos(45, 90);
+    while (gServoService && (result == ServoService::ServoActionResult::IN_PROGRESS))
+    {
+        gServoService->updateServos();
+        if (gServoService->getVerticalServoState() == ServoState::IDLE &&
+            gServoService->getHorizontalServoState() == ServoState::IDLE)
+        {
+            break;
+        }
+    }
+    delay(500);
+    const auto result2 = gServoService->moveServos(-90, -180);
+    while (gServoService && (result2 == ServoService::ServoActionResult::IN_PROGRESS))
+    {
+        gServoService->updateServos();
+        if (gServoService->getVerticalServoState() == ServoState::IDLE &&
+            gServoService->getHorizontalServoState() == ServoState::IDLE)
+        {
+            break;
+        }
+    }
+    delay(500);
+    const auto result3 = gServoService->moveServos(45, 90);
+    while (gServoService && (result3 == ServoService::ServoActionResult::IN_PROGRESS))
+    {
+        gServoService->updateServos();
+        if (gServoService->getVerticalServoState() == ServoState::IDLE &&
+            gServoService->getHorizontalServoState() == ServoState::IDLE)
+        {
+            break;
+        }
+    }
+    delay(500);
+}
+
+void fatalError(const String& errorMessage)
+{
+    LOG_ERROR_BLE("Fatal error, reset by button: " + errorMessage);
+    pinMode(LED_BUILTIN, OUTPUT);
+    while(true) {
+        digitalWrite(LED_BUILTIN, HIGH);
+        delay(200);
+        digitalWrite(LED_BUILTIN, LOW);
+        delay(200);
+    }
+}
+
 void setup()
 {
     initLogger();
@@ -527,51 +630,54 @@ void setup()
     const auto processingCallback = [](const RawMessage& command)
     {
         LOG_INFO_BLE("Processing incoming BLE message...");
+
         if (!gServoService)
         {
             LOG_ERROR_BLE("Servo service not initialized");
-            return BluetoothService::BluetoothMessageResult::PROCESSING_FAILED;
+            return BluetoothService::BluetoothMessageResult::SERVO_UNINITIALIZED;
         }
+
+        if(!gServoService->areServosIdle())
+        {
+            LOG_WARN_BLE("Servos are busy. Cannot process new command.");
+            return BluetoothService::BluetoothMessageResult::ROBOT_BUSY;
+        }
+        else if(gServoService->getCurrentMsgId() != 0)
+        {
+            LOG_INFO_BLE("Previous task finished. Sending Task Finished response.");
+            if(!gBleService->sendTaskFinishedResponse(gServoService->getCurrentMsgId()))
+            {
+                LOG_ERROR_BLE("Failed to send Task Finished response");
+                return BluetoothService::BluetoothMessageResult::SENDING_MESSAGE_FAILED;
+            }
+            gServoService->setCurrentMsgId(0);
+        }
+
         ServoRequest servoCommand;
         if (!gServoService->parseServoRequest(command, servoCommand))
         {
             return BluetoothService::BluetoothMessageResult::VALIDATION_FAILED;
         }
-        const auto result =
-            gServoService->moveServos(servoCommand.s1_offset, servoCommand.s2_offset);
-        if (result != ServoService::ServoActionResult::OK)
+
+        if(!gBleService->sendAckResponse(servoCommand.msg_id))
+        {
+            LOG_ERROR_BLE("Failed to send ACK response");
+            return BluetoothService::BluetoothMessageResult::SENDING_MESSAGE_FAILED;
+        }
+
+        const auto result = gServoService->moveServos(servoCommand.h_offset, servoCommand.v_offset);
+        if (result != ServoService::ServoActionResult::IN_PROGRESS)
         {
             return BluetoothService::BluetoothMessageResult::PROCESSING_FAILED;
         }
+        
         return BluetoothService::BluetoothMessageResult::OK;
     };
     gBleService = new BluetoothService(std::move(processingCallback));
 
-    // Test servo movement on startup
-    const auto result = gServoService->moveServos(90, 90);
-    while (gServoService && (result == ServoService::ServoActionResult::OK))
-    {
-        gServoService->updateServos();
-        if (gServoService->getVerticalServoState() == ServoState::IDLE &&
-            gServoService->getHorizontalServoState() == ServoState::IDLE)
-        {
-            break;
-        }
-        delay(1);
-    }
-    delay(2000);
-    const auto result2 = gServoService->moveServos(-180, -180);
-    while (gServoService && (result2 == ServoService::ServoActionResult::OK))
-    {
-        gServoService->updateServos();
-        if (gServoService->getVerticalServoState() == ServoState::IDLE &&
-            gServoService->getHorizontalServoState() == ServoState::IDLE)
-        {
-            break;
-        }
-        delay(1);
-    }
-    delay(2000);
+    LOG_INFO_BLE("Setup complete. Running test routine...");
+    runTestRoutine();
+    LOG_INFO_BLE("Test routine complete. Entering main loop.");
 }
 
 void loop()
@@ -591,6 +697,7 @@ void loop()
         {
             gServoService->updateServos();
         }
+        delay(1);
     }
     LOG_PERIODIC_BLE("Device disconnected. Atempting to recconect after 3 seconds.");
     sleep(3);
