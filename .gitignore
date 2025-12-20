@@ -1,2 +1,4 @@
 .theia
 .vscode
+.pio
+compile_commands.json
