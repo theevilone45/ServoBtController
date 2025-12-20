@@ -35,6 +35,10 @@ const char* getSeverityString(Severity severity)
 void initLogger()
 {
     Serial.begin(9600);
-    while (!Serial)
-        ;
+    // Wait up to 2 seconds for serial monitor, then continue anyway
+    unsigned long startTime = millis();
+    while (!Serial && (millis() - startTime < 2000))
+    {
+        delay(10);
+    }
 }
